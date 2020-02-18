@@ -1541,4 +1541,46 @@ package object config {
     .bytesConf(ByteUnit.BYTE)
     .createOptional
 
+  private[spark] val GRACEFUL_DECOMMISSION_ENABLE =
+    ConfigBuilder("spark.graceful.decommission.enable")
+      .doc("Whether to enable the Qubole's node graceful decommissioning handling")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val GRACEFUL_DECOMMISSION_FETCHFAILED_IGNORE_THRESHOLD =
+    ConfigBuilder("spark.graceful.decommission.fetchfailed.ignore.threshold")
+      .doc("Threshold of number of times fetchfailed ignored due to node decommission")
+      .intConf
+      .createWithDefault(8)
+
+  private[spark] val GRACEFUL_DECOMMISSION_EXECUTOR_LEASETIME_PCT =
+    ConfigBuilder("spark.graceful.decommission.executor.leasetimePct")
+      .doc("Percentage of time to expiry after which executors are killed " +
+        "(if enabled) on the node. Value ranges between (0-100)")
+      .intConf
+      .checkValue(v => v >= 0 && v < 100, "The percentage should be positive.")
+      .createWithDefault(50) // Pulled out of thin air.
+
+  private[spark] val GRACEFUL_DECOMMISSION_SHUFFLEDATA_LEASETIME_PCT =
+    ConfigBuilder("spark.graceful.decommission.shuffedata.leasetimePct")
+      .doc("Percentage of time to expiry after which shuffle data " +
+        "cleaned up (if enabled) on the node. Value ranges between (0-100)")
+      .intConf
+      .checkValue(v => v >= 0 && v < 100, "The percentage should be positive.")
+      .createWithDefault(90) // Pulled out of thin air.
+
+  private[spark] val GRACEFUL_DECOMMISSION_MIN_TERMINATION_TIME_IN_SEC =
+    ConfigBuilder("spark.graceful.decommission.min.termination.time")
+      .doc("Minimum time to termination below which node decommissioning is performed immediately")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefaultString("60s")
+
+  private[spark] val ABOUT_TO_BE_LOST_NODE_INTERVAL =
+    ConfigBuilder("spark.abouttobelost.node.interval")
+      .doc("Interval in seconds after which the node is decommissioned in case aws spotloss" +
+        "the time is approximately 110s and in case of GCP preemptible VMs this is around 30s" +
+        "this config can be changed according to node type in the public cloud")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefaultString("110s")
+
 }

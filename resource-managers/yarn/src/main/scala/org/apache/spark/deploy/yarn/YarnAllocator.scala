@@ -24,8 +24,10 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.collection.mutable.{ArrayBuffer, HashMap, HashSet}
+import scala.util.{Failure, Success}
 import scala.util.control.NonFatal
 
+import org.apache.hadoop.yarn.api.protocolrecords.AllocateResponse
 import org.apache.hadoop.yarn.api.records._
 import org.apache.hadoop.yarn.client.api.AMRMClient
 import org.apache.hadoop.yarn.client.api.AMRMClient.ContainerRequest
@@ -41,10 +43,11 @@ import org.apache.spark.internal.config.Python._
 import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef}
 import org.apache.spark.scheduler.{ExecutorExited, ExecutorLossReason}
-import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RemoveExecutor
-import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.RetrieveLastAllocatedExecutorId
-import org.apache.spark.scheduler.cluster.SchedulerBackendUtils
+import org.apache.spark.scheduler.cluster.{ClusterInfo, NodeInfo, NodeState, SchedulerBackendUtils}
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{ClusterInfoUpdate, NodeLossNotification, RemoveExecutor, RetrieveLastAllocatedExecutorId}
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils}
+
+
 
 /**
  * YarnAllocator is charged with requesting containers from the YARN ResourceManager and deciding
@@ -113,6 +116,16 @@ private[yarn] class YarnAllocator(
   @volatile private var targetNumExecutors =
     SchedulerBackendUtils.getInitialTargetExecutorNumber(sparkConf)
 
+  // Cluster info is information about cluster passed from AM -> Driver.
+  // we keep it cached on the AM side till it is sent to driver and is
+  // cleared once successfully sent. On failure, the failed message is
+  // sent in next cycle.
+  // Visible for testing
+  private val currentClusterInfo = ClusterInfo(new HashMap[String, NodeInfo])
+
+  // Interval in seconds after which the node is decommissioned after this time node
+  // is not available to use.
+  private val nodeLossInterval = sparkConf.get(ABOUT_TO_BE_LOST_NODE_INTERVAL)
 
   // Executor loss reason requests that are pending - maps from executor ID for inquiry to a
   // list of requesters that should be responded to once we find out why the given executor
@@ -281,6 +294,43 @@ private[yarn] class YarnAllocator(
       logDebug("Finished processing %d completed containers. Current running executor count: %d."
         .format(completedContainers.size, runningExecutors.size))
     }
+
+    // If the flags is enabled than QUBOLE_GRACEFUL_DECOMMISSION_ENABLE
+    // than handling the spot scenario using the decommission tracker.
+    if (sparkConf.get(GRACEFUL_DECOMMISSION_ENABLE)) {
+      processGracefulDecommission(allocateResponse)
+    }
+  }
+
+  def processGracefulDecommission(allocateResponse: AllocateResponse): Unit = {
+    // Create a consolidated node decommission info report.
+    val nodeInfos = new HashMap[String, NodeInfo]
+
+    // node with updated information.
+    val getUpdatedNodes = allocateResponse.getUpdatedNodes()
+    if (getUpdatedNodes != null) {
+      val updatedNodes = getUpdatedNodes.asScala
+      for (x <- updatedNodes) {
+        if (x.getNodeState.toString.equals("DECOMMISSIONING")) {
+          // If in future there is support added in hadoop to get the termination time
+          // of the node nodeTerminationTime can be updated with that value
+          val nodeTerminationTime = clock.getTimeMillis() + nodeLossInterval * 1000
+          nodeInfos(x.getNodeId().getHost())
+            = NodeInfo(terminationTime = Some(nodeTerminationTime),
+            nodeState = NodeState.getYarnNodeState(x.getNodeState()))
+        } else {
+          nodeInfos(x.getNodeId().getHost())
+            = NodeInfo(terminationTime = None,
+            nodeState = NodeState.getYarnNodeState(x.getNodeState()))
+        }
+      }
+    }
+
+    // available resource in the cluster
+    logDebug(("Allocate response: Remaining available resource %d")
+      .format(allocateResponse.getAvailableResources))
+
+    processClusterInfo(ClusterInfo(nodeInfos = nodeInfos))
   }
 
   /**
@@ -715,6 +765,30 @@ private[yarn] class YarnAllocator(
       }
     }
   }
+
+  private[yarn] def processClusterInfo(clusterInfo: ClusterInfo): Unit = {
+
+    // Existing cached value is not empty send out union
+    // report.
+    val fullSync = currentClusterInfo.nodeInfos.size > 0
+
+    // Update cached currentClusterInfo.
+    clusterInfo.nodeInfos.foreach{case(k, v) => currentClusterInfo.nodeInfos(k) = v}
+
+    if (fullSync) {
+      logInfo(s"clusterInfoUpdate: full sync $currentClusterInfo")
+    } else {
+      logInfo(s"clusterInfoUpdate: partial sync $currentClusterInfo")
+    }
+
+    driverRef.ask[Boolean](ClusterInfoUpdate(currentClusterInfo)).andThen {
+      case Success(b) => currentClusterInfo.nodeInfos.clear() // Clear cached data
+      case Failure(f) => logInfo(s"clusterInfoUpdate: sync failed ($f)." +
+        s" Will be synced in next cycle")
+    }(ThreadUtils.sameThread)
+    // Since the time taken to complete is small , so used the single thread here.
+  }
+
 
   /**
    * Register that some RpcCallContext has asked the AM why the executor was lost. Note that

@@ -74,6 +74,10 @@ private[spark] class TaskSchedulerImpl(
   // because ExecutorAllocationClient is created after this TaskSchedulerImpl.
   private[scheduler] lazy val blacklistTrackerOpt = maybeCreateBlacklistTracker(sc)
 
+  // initializing decommissionTracker
+  // NB: Public for testing
+  lazy val decommissionTrackerOpt = maybeCreateDecommissionTracker(sc)
+
   val conf = sc.conf
 
   // How often to check for speculative tasks
@@ -253,7 +257,7 @@ private[spark] class TaskSchedulerImpl(
   private[scheduler] def createTaskSetManager(
       taskSet: TaskSet,
       maxTaskFailures: Int): TaskSetManager = {
-    new TaskSetManager(this, taskSet, maxTaskFailures, blacklistTrackerOpt)
+    new TaskSetManager(this, taskSet, maxTaskFailures, blacklistTrackerOpt, decommissionTrackerOpt)
   }
 
   override def cancelTasks(stageId: Int, interruptThread: Boolean): Unit = synchronized {
@@ -719,6 +723,7 @@ private[spark] class TaskSchedulerImpl(
     }
     starvationTimer.cancel()
     abortTimer.cancel()
+    decommissionTrackerOpt.map(_.stop)
   }
 
   override def defaultParallelism(): Int = backend.defaultParallelism()
@@ -974,6 +979,27 @@ private[spark] object TaskSchedulerImpl {
         case _ => None
       }
       Some(new BlacklistTracker(sc, executorAllocClient))
+    } else {
+      None
+    }
+  }
+
+  private def maybeCreateDecommissionTracker(sc: SparkContext): Option[DecommissionTracker] = {
+    if (DecommissionTracker.isDecommissionEnabled(sc.conf)) {
+      val executorAllocClient: Option[ExecutorAllocationClient] = sc.schedulerBackend match {
+        case b: ExecutorAllocationClient => Some(b)
+        case _ => None
+      }
+
+      val dagScheduler: Option[DAGScheduler] = sc.dagScheduler match {
+        case b: DAGScheduler => Some(b)
+        case _ => None
+      }
+      if (executorAllocClient.isDefined && dagScheduler.isDefined) {
+        Some(new DecommissionTracker(sc, executorAllocClient, dagScheduler))
+      } else {
+        None
+      }
     } else {
       None
     }
